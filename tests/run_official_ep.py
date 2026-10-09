@@ -1,0 +1,102 @@
+import os
+import sys
+import argparse
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_MPI = 'OMPI_COMM_WORLD_RANK' in os.environ
+if _MPI:
+    from tests.mpi_bootstrap import setup_paddle_env
+    setup_paddle_env()
+
+_LOCAL_RANK = int(os.environ.get('PADDLE_LOCAL_RANK', os.environ.get('FLAGS_selected_gpus', '0')) or '0')
+
+import paddle
+import paddle.distributed as dist
+from paddle.distributed import fleet
+
+paddle.enable_compat()
+
+import torch  # noqa: E402 
+
+import tests.elastic.test_ep as tep  # noqa: E402
+
+
+def _fleet_init_dist(local_rank: int, num_local_ranks: int, seed: int = 0):
+    total = num_local_ranks if _MPI else num_local_ranks * int(os.getenv('WORLD_SIZE', '1'))
+    group = dist.new_group(list(range(total)))
+    import deep_ep.utils.envs as _envs
+    _envs._local_rank = local_rank
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('cuda')
+    torch.cuda.set_device(local_rank)
+    tep.init_seed(seed)
+    return dist.get_rank(), dist.get_world_size(), group
+
+
+def _init_dist_env(world_size, seed=20):
+    strategy = fleet.DistributedStrategy()
+    strategy.hybrid_configs = {
+        'dp_degree': 1, 'mp_degree': world_size, 'pp_degree': 1, 'sharding_degree': 1,
+    }
+    strategy.tensor_parallel_configs = {'tensor_init_seed': seed}
+    fleet.init(is_collective=True, strategy=strategy)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--skip-perf-test', action='store_true')
+    parser.add_argument('--test-first-only', action='store_true')
+    parser.add_argument('--do-pressure-test', action='store_true')
+    parser.add_argument('--deterministic', action='store_true')
+    parser.add_argument('--pressure-iters', type=int, default=0,
+                        help='bound pressure iterations (0 = official 1e9)')
+    parser.add_argument('--num-tokens', type=int, default=128)
+    parser.add_argument('--hidden', type=int, default=2048)
+    parser.add_argument('--num-topk', type=int, default=8)
+    parser.add_argument('--num-experts', type=int, default=16)
+    parser.add_argument('--num-sms', type=int, default=0)
+    args, _ = parser.parse_known_args()
+
+    if args.pressure_iters > 0:
+        import builtins
+        _orig_range = builtins.range
+        _cap = args.pressure_iters
+        def _capped_range(*a):
+            r = _orig_range(*a)
+            return r if len(r) < int(1e9) else _orig_range(_cap)
+        tep.range = _capped_range  
+
+    defaults = dict(
+        num_processes=2, num_sms=args.num_sms, num_qps=0, num_allocated_qps=0,
+        num_gpu_timeout_secs=100, num_cpu_timeout_secs=100, sl_idx=0,
+        num_tokens=args.num_tokens, hidden=args.hidden,
+        num_topk=args.num_topk, num_experts=args.num_experts,
+        do_cpu_sync=1, allow_hybrid_mode=1, allow_multiple_reduction=1,
+        prefer_overlap_with_compute=0, deterministic=args.deterministic,
+        seed=0, skip_check=False, skip_perf_test=args.skip_perf_test,
+        do_pressure_test=args.do_pressure_test, reuse_elastic_buffer=False,
+        test_first_only=args.test_first_only, unbalanced_ratio=1.0,
+        precise_unbalanced_ratio=False, masked_ratio=0.0,
+        dump_profile_traces='', ignore_local_traffic=False,
+    )
+    for k, v in defaults.items():
+        setattr(args, k, v)
+
+    tep.init_dist = _fleet_init_dist
+
+    if int(os.getenv('EP_BF16_ONLY', '0')):
+        _orig_enum = tep.enumerate_ep_modes
+        tep.enumerate_ep_modes = lambda: (m for m in _orig_enum() if m[2] == 0)
+
+    world = int(os.environ.get('PADDLE_TRAINERS_NUM', '1'))
+    if world > 1:
+        _init_dist_env(world)
+
+    tep.test_loop(_LOCAL_RANK, world, args)
+    if dist.get_rank() == 0:
+        print(f'\n[rank0] OFFICIAL test_ep (new paddle, no runner patches) DONE')
+
+
+if __name__ == '__main__':
+    main()

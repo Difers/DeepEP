@@ -2,6 +2,21 @@ import torch
 from typing import Tuple
 
 
+# NOTE(paddle-compat): `torch.compile` proxies to `paddle.compile`,
+# which does not exist. These FP8 cast helpers only need `torch.compile` for speed, so
+# fall back to a no-op decorator when it is unavailable. Correctness is unaffected.
+def _maybe_compile(**kwargs):
+    def _decorator(fn):
+        compile_fn = getattr(torch, 'compile', None)
+        if compile_fn is None:
+            return fn
+        try:
+            return compile_fn(fn, **kwargs)
+        except Exception:
+            return fn
+    return _decorator
+
+
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     x, y = x.double() + 1, y.double() + 1
     denominator = (x * x + y * y).sum()
@@ -27,7 +42,7 @@ def align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
-@torch.compile(dynamic=True)
+@_maybe_compile(dynamic=True)
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
@@ -39,7 +54,7 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         m, aligned_n)[:, :n].contiguous(), (x_amax / 448.0).view(m, -1)
 
 
-@torch.compile(dynamic=True)
+@_maybe_compile(dynamic=True)
 def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor) -> torch.Tensor:
     if x_fp8.numel() == 0:
         return x_fp8.to(torch.bfloat16)

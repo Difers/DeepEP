@@ -19,6 +19,8 @@ build/
 *.so
 deep_ep.egg-info/
 dist/
+# Paddle cpp_extension generated loader stub (pairs with deep_ep/_C_pd_.so)
+deep_ep/_C.py
 
 # Coredump
 coredump/

@@ -142,8 +142,11 @@ def generate_pre_combine_data(src_token_global_idx: torch.Tensor,
     - Generated data, `[num_tokens, num_topk, hidden]`
     """
     num_ranks = dist.get_world_size()
+    # NOTE(paddle-compat): paddle compat does not auto-promote int32*int64;
+    # align arange dtype with `src_token_global_idx` to avoid a type-promotion error.
     token_seeds = (src_token_global_idx.unsqueeze(1) * num_topk +
-                   torch.arange(num_topk, device=src_token_global_idx.device).unsqueeze(0))  # [num_tokens, num_topk]
+                   torch.arange(num_topk, device=src_token_global_idx.device,
+                                dtype=src_token_global_idx.dtype).unsqueeze(0))  # [num_tokens, num_topk]
     max_seed = num_ranks * num_max_tokens_per_rank * num_topk
     result = torch.sin(
         (((token_seeds * 131071 % max_seed).float() + 1) / max_seed).unsqueeze(-1) *

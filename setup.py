@@ -8,7 +8,7 @@ import importlib
 
 from pathlib import Path
 from setuptools.command.build_py import build_py
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from paddle.utils.cpp_extension import BuildExtension, CUDAExtension
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 persistent_env_names = ('EP_JIT_CACHE_DIR', 'EP_JIT_PRINT_COMPILER_COMMAND', 'EP_JIT_CPP_STANDARD',
