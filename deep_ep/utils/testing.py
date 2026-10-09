@@ -149,73 +149,86 @@ def bench_kineto(fn,
     fn()
     torch.cuda.synchronize()
 
-    # Profile
+    # Profile with paddle.profiler (CUPTI-backed) and derive per-kernel GPU time by name.
+    # NOTE(paddle-compat): Paddle has no torch.profiler.{schedule,profile,ProfilerActivity} nor
+    # key_averages(). Use Profiler + make_scheduler + export_chrome_tracing, then parse device
+    # kernel events (cat == 'Kernel') from the emitted chrome trace.
+    import paddle
+    from paddle import profiler as _P
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     barrier_comm_profiling &= int(os.environ.get('EP_DISABLE_BARRIER_PROFILING', 0)) == 0
+    _trace_dir = tempfile.mkdtemp(prefix='ep_kineto_')
     with suppress():
-        schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
-        profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule, acc_events=True)
+        # Equivalent to torch schedule(wait=0, warmup=1, active=1, repeat=1): skip cycle 1 (warmup),
+        # record cycle 2.
+        scheduler = _P.make_scheduler(closed=0, ready=1, record=1, repeat=1)
+        profiler = _P.Profiler(targets=[_P.ProfilerTarget.GPU], scheduler=scheduler,
+                               on_trace_ready=_P.export_chrome_tracing(_trace_dir))
         dummy = torch.ones(1, dtype=torch.float, device='cuda')
-        with profiler:
-            for i in range(2):
-                for _ in range(num_tests):
-                    # Flush L2 cache
-                    flush_l2_cache(flush_l2)
+        profiler.start()
+        for i in range(2):
+            for _ in range(num_tests):
+                # Flush L2 cache
+                flush_l2_cache(flush_l2)
 
-                    # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
-                    if barrier_comm_profiling:
-                        torch.cuda._sleep(int(2e7)) # ~10ms
+                # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
+                if barrier_comm_profiling:
+                    # NOTE(paddle-compat): torch.cuda._sleep (a lightweight ~10ms GPU busy-wait) has
+                    # no Paddle equivalent, so skip it when absent. It only smooths launch jitter;
+                    # skipping adds timing noise but not incorrectness. Do NOT substitute a heavy op
+                    # (e.g. a large matmul): it would contend for the GPU and pollute the measurement.
+                    _sleep = getattr(torch.cuda, '_sleep', None)
+                    if _sleep is not None:
+                        _sleep(int(2e7)) # ~10ms
 
-                        # Some network may have ring-based implement, so be careful to use `all_reduce`
-                        if barrier is None:
-                            dist.all_reduce(dummy)
-                        else:
-                            barrier()
-                    fn()
-                torch.cuda.synchronize()
-                profiler.step()
+                    # Some network may have ring-based implement, so be careful to use `all_reduce`
+                    if barrier is None:
+                        dist.all_reduce(dummy)
+                    else:
+                        barrier()
+                fn()
+            torch.cuda.synchronize()
+            profiler.step()
+        profiler.stop()
 
-    # Parse the profiling table
-    prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
+    # Parse the chrome trace: collect device-kernel events (cat == 'Kernel') by name
+    import glob
+    trace_files = sorted(glob.glob(os.path.join(_trace_dir, '*.json')), key=os.path.getmtime)
+    assert trace_files, f'paddle profiler produced no trace in {_trace_dir}'
+    trace_data = json.loads(Path(trace_files[-1]).read_text())
+    all_events = trace_data['traceEvents'] if isinstance(trace_data, dict) else trace_data
+    kernel_events = [e for e in all_events
+                     if isinstance(e, dict) and e.get('cat') == 'Kernel' and 'dur' in e and 'name' in e]
+
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
-    for name in kernel_names:
-        assert sum([name in line for line in prof_lines]) <= 1, f'Errors of the kernel {name} in the profiling table: {prof_lines}'
 
-    # Save chrome traces
+    # Save chrome trace
     if trace_path is not None:
-        profiler.export_chrome_trace(trace_path)
+        import shutil
+        shutil.copy(trace_files[-1], trace_path)
 
-    # Return average kernel durations
-    units = {'ms': 1e3, 'us': 1e6}
+    # Return average kernel durations (seconds). `dur` in paddle chrome trace is microseconds.
     kernel_durations = []
     for name in kernel_names:
-        total_time = 0
-        total_num = 0
-        for line in prof_lines:
-            if name in line:
-                time_str = line.split()[-2]
-                num_str = line.split()[-1]
-                for unit, scale in units.items():
-                    if unit in time_str:
-                        total_time += float(time_str.replace(unit, '')) / scale * int(num_str)
-                        total_num += int(num_str)
-                        break
-        kernel_durations.append(total_time / total_num if total_num > 0 else 0)
-
-    # Expand the kernels by periods
-    if num_kernels_per_period > 1:
-        with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
-            profiler.export_chrome_trace(tmp.name)
-            profile_data = json.loads(Path(tmp.name).read_text())
-
-        for i, kernel_name in enumerate(kernel_names):
-            events = [event for event in profile_data['traceEvents'] if f'::{kernel_name}' in event['name']]
-            events = sorted(events, key=lambda event: event['ts'])
-            durations = [event['dur'] / 1e6 for event in events]
-            assert len(durations) % num_kernels_per_period == 0
+        matched = sorted([e for e in kernel_events if name in e['name']], key=lambda e: e['ts'])
+        durations = [e['dur'] / 1e6 for e in matched]
+        if int(os.environ.get('EP_BENCH_DEBUG', 0)):
+            _us = [round(d * 1e6, 1) for d in durations]
+            print(f'[bench_kineto] kernel={name!r} matched={len(durations)} '
+                  f'avg={sum(_us)/len(_us) if _us else 0:.1f}us durs(us)={_us[:40]}', flush=True)
+        if num_kernels_per_period > 1:
+            assert len(durations) % num_kernels_per_period == 0, \
+                f'{name}: got {len(durations)} kernels, not divisible by {num_kernels_per_period}'
             num_kernel_patterns = len(durations) // num_kernels_per_period
-            kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns for j in range(num_kernels_per_period)]
+            kernel_durations.append([sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
+                                     for j in range(num_kernels_per_period)])
+        else:
+            kernel_durations.append(sum(durations) / len(durations) if durations else 0.0)
+
+    # Clean up the temporary trace directory
+    import shutil
+    shutil.rmtree(_trace_dir, ignore_errors=True)
 
     # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]

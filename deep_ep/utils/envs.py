@@ -86,7 +86,7 @@ def dist_print(s: str = '', once_in_node: bool = False) -> None:
     dist.barrier()
 
 
-def init_dist(local_rank: int, num_local_ranks: int, seed: int = 0) -> Tuple[int, int, dist.ProcessGroup]:
+def init_dist(local_rank: int, num_local_ranks: int, seed: int = 0) -> Tuple[int, int, Group]:
     """
     Initialize the distributed environment with NCCL backend.
 
@@ -143,7 +143,7 @@ def get_logical_domain_size(group: dist.ProcessGroup, allow_hybrid_mode: bool = 
     return comm.get_logical_domain_size(group, allow_hybrid_mode)
 
 
-def check_nvlink_connections(group: dist.ProcessGroup) -> None:
+def check_nvlink_connections(group: Group) -> None:
     """
     Check NVLink connection between every pair of GPUs.
 
@@ -154,7 +154,7 @@ def check_nvlink_connections(group: dist.ProcessGroup) -> None:
     # NOTES: some A100 PCIE GPUs only have pairwise NVLink connection, so that we can only use EP2
     # TODO: check all cases, all local-node GPUs in the group should be connected via NVLink
     if 'PCIE' in torch.cuda.get_device_name():
-        assert group.size() <= 2, 'PCIe GPUs only have pairwise NVLink connections'
+        assert group.world_size <= 2, 'PCIe GPUs only have pairwise NVLink connections'
 
         # noinspection PyUnresolvedReferences
         import pynvml
@@ -163,7 +163,7 @@ def check_nvlink_connections(group: dist.ProcessGroup) -> None:
         # noinspection PyTypeChecker
         devices = os.environ.get('CUDA_VISIBLE_DEVICES', '0,1,2,3,4,5,6,7').strip(',').split(',')
         physical_device_idx = int(devices[torch.cuda.current_device()])
-        physical_device_indices = [0, ] * group.size()
+        physical_device_indices = [0, ] * group.world_size
         dist.all_gather_object(physical_device_indices, physical_device_idx, group)
 
         # Check whether they are all connected via NVLink
@@ -187,6 +187,11 @@ def check_torch_deterministic() -> None:
     When both are on, `torch.empty()` calls an initialization kernel that may overlap with communication streams,
     causing errors.
     """
+    # NOTE(paddle-compat): `torch.are_deterministic_algorithms_enabled` /
+    # `torch.utils.deterministic.fill_uninitialized_memory` do not exist under Paddle compat.
+    # This guard only matters when deterministic algorithms are enabled; skip if the API is absent.
+    if not hasattr(torch, 'are_deterministic_algorithms_enabled'):
+        return
     assert not (torch.are_deterministic_algorithms_enabled() and torch.utils.deterministic.fill_uninitialized_memory)
 
 
