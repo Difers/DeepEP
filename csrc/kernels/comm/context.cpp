@@ -13,6 +13,10 @@
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/layout/bucket/workspace.cuh>
 
+#include "paddle/fluid/distributed/collective/process_group_nccl.h"
+#include "paddle/phi/core/platform/device_context.h"
+#include "paddle/phi/core/memory/allocation/allocator_facade.h"
+
 #include "api.hpp"
 #include "../../runtime/jit.hpp"
 #include "../../utils/system.hpp"
@@ -47,6 +51,38 @@ void destroy_nccl_comm(const int64_t& nccl_comm) {
     NCCL_CHECK(ncclCommAbort(reinterpret_cast<ncclComm_t>(nccl_comm)));
     if (get_env<int>("EP_BUFFER_DEBUG"))
         printf("NCCL host communicator aborted\n");
+}
+
+// NOTE: instead of self-building a comm from an all-gathered unique id,
+// borrow the communicator that Paddle's own ProcessGroupNCCL already created for this group
+// (`group.id -> ProcessGroupMapFromGid -> ProcessGroupNCCL -> GetNcclComm`). Borrowed, so DeepEP
+// must NOT destroy it (Paddle owns the lifecycle). Aligns comm/stream semantics with Paddle.
+int64_t get_nccl_comm_from_group(const int& context_ring_id) {
+    int device_id = 0;
+    CUDA_RUNTIME_CHECK(cudaGetDevice(&device_id));
+    auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+    paddle::distributed::ProcessGroup* pg = map->get(context_ring_id);
+    EP_HOST_ASSERT(pg != nullptr and "Paddle ProcessGroup not found for the given group id");
+    auto* nccl_pg = reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg);
+    auto* comm_ctx = nccl_pg->GetOrCreateCommContext(
+        phi::GPUPlace(device_id), phi::distributed::CommType::ALLTOALL);
+    return reinterpret_cast<int64_t>(comm_ctx->GetNcclComm());
+}
+
+// NOTE: point the current-device GPUContext's allocator at `stream` without
+// swapping the global current stream. torch's `setCurrentCUDAStream(comm_stream)` crashes under
+// Paddle because the stream/allocator are bound to a process-wide GPUContext and swapping it onto
+// a foreign (pool) stream mismatches the primary context. Swapping only the allocator bucket keeps
+// allocations on the comm stream while leaving the global context/stream intact.
+void set_compute_allocator_stream(cudaStream_t stream) {
+    int device_id = 0;
+    CUDA_RUNTIME_CHECK(cudaGetDevice(&device_id));
+    const auto place = phi::GPUPlace(device_id);
+    auto* ctx = reinterpret_cast<phi::GPUContext*>(
+        paddle::platform::DeviceContextPool::Instance().Get(place));
+    ctx->SetAllocator(paddle::memory::allocation::AllocatorFacade::Instance()
+                          .GetAllocator(place, stream)
+                          .get());
 }
 
 std::tuple<int, int> get_physical_domain_size(const int64_t& nccl_comm) {

@@ -35,14 +35,14 @@ class PPBuffer(BufferBase):
 
         # Create CPP runtime
         self.runtime = _C.PPBuffer(
-            group.rank(), group.size(), self.nccl_comm_handle.get(),
+            group.rank, group.world_size, self.nccl_comm_handle.get(),
             num_max_tensor_bytes, num_max_inflight_tensors,
             sl_idx, num_gpu_timeout_secs, explicitly_destroy)
         self.storage = self.runtime.storage
 
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
-        group.barrier()
+        dist.barrier(group)  # paddle: no Group.barrier()
         torch.cuda.synchronize()
 
     def send(self, x: torch.Tensor, dst_rank_idx: int, num_sms: Optional[int] = None) -> None:

@@ -23,6 +23,7 @@ static void register_apis(pybind11::module_& m) {
 
     m.def("get_local_nccl_unique_id", &get_local_unique_id);
     m.def("create_nccl_comm", &create_nccl_comm);
+    m.def("get_nccl_comm_from_group", &get_nccl_comm_from_group);
     m.def("destroy_nccl_comm", &destroy_nccl_comm);
     m.def("get_physical_domain_size", &get_physical_domain_size);
     m.def("get_logical_domain_size", &get_logical_domain_size);

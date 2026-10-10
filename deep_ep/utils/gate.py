@@ -13,12 +13,13 @@ def generate_topk_idx(rank_count: torch.Tensor, num_tokens: int, num_experts: in
     base_vals = torch.arange(num_experts, device='cuda').view(1, num_ranks, num_experts_per_rank).expand(num_tokens, num_ranks, num_experts_per_rank)
 
     # Randomize the ordering within each row
-    rand_vals = torch.rand(num_tokens, num_ranks, num_experts_per_rank, device='cuda')
+    rand_vals = torch.rand(num_tokens, num_ranks, num_experts_per_rank, device='cuda', dtype=torch.float32)
     perm_indices = torch.argsort(rand_vals, dim=-1)
     permuted = torch.gather(base_vals, 2, perm_indices)
 
     # Create the mask
-    k_idx = torch.arange(num_experts_per_rank, device='cuda').view(1, 1, num_experts_per_rank).expand(num_tokens, num_ranks, num_experts_per_rank)
+    # NOTE: paddle does not auto-promote int32 vs int64 in comparisons; align dtype.
+    k_idx = torch.arange(num_experts_per_rank, device='cuda', dtype=rank_count.dtype).view(1, 1, num_experts_per_rank).expand(num_tokens, num_ranks, num_experts_per_rank)
     rank_count_expanded = rank_count.unsqueeze(2).expand(num_tokens, num_ranks, num_experts_per_rank)
     mask = k_idx < rank_count_expanded
 
@@ -43,7 +44,9 @@ def generate_rank_count(num_tokens: int, num_experts: int, num_ranks: int, num_t
     assert ratio >= 1.0, 'ratio must be no less than 1.0'
 
     # Generate rank count of each token from random distribution
-    random_scores = torch.rand(num_tokens, num_experts, device='cuda')
+    # NOTE(paddle-compat): pin float32; the default dtype may be bfloat16 (the EP test sets
+    # it), and paddle's uniform/rand kernel does not support bfloat16. Only used for ordering.
+    random_scores = torch.rand(num_tokens, num_experts, device='cuda', dtype=torch.float32)
     topk_weights_, topk_indices = torch.topk(random_scores, num_topk, dim=1, largest=True, sorted=False)
     topk_indices //= num_experts_per_rank
     sorted_topk_indices = torch.sort(topk_indices, dim=1)[0]

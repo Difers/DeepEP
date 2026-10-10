@@ -102,7 +102,12 @@ class EPHandle:
 
         # `topk_idx` cannot change in the handle
         self._topk_idx = topk_idx
-        self._topk_idx_version = None if topk_idx.is_inference() else topk_idx._version
+        # Paddle Tensor has no is_inference()/_version; skip version
+        # tracking (the mutation assert in `topk_idx` short-circuits when version is None).
+        self._topk_idx_version = (
+            None if getattr(topk_idx, 'is_inference', lambda: True)()
+            else getattr(topk_idx, '_version', None)
+        )
 
     @property
     def topk_idx(self) -> torch.Tensor:
@@ -202,7 +207,12 @@ class EPHandle:
             permute(recv_topk_weights, orig_indices_for_expanded_tensors)
 
             to_indices_for_expanded_tensors = get_reverse_permutation(orig_indices_for_expanded_tensors)
-            self.recv_src_metadata[:, 2:][valid_mask] = to_indices_for_expanded_tensors[self.recv_src_metadata[:, 2:][valid_mask]]
+            # NOTE: torch's chained slice-view assignment `a[:, 2:][mask] = v`
+            # relies on `a[:, 2:]` being a writable view; under Paddle the masked `__setitem__` on
+            # that temporary view does not write back to `a`. Clone -> mutate -> write back instead.
+            slot_ptrs = self.recv_src_metadata[:, 2:].clone()
+            slot_ptrs[valid_mask] = to_indices_for_expanded_tensors[slot_ptrs[valid_mask]]
+            self.recv_src_metadata[:, 2:] = slot_ptrs
 
 
 class EPBuffer(BufferBase):
@@ -288,8 +298,8 @@ class EPBuffer(BufferBase):
         """
         # Some useful utilities
         self.group = group
-        self.rank_idx = group.rank()
-        self.num_ranks = group.size()
+        self.rank_idx = group.rank  # paddle Group: property
+        self.num_ranks = group.world_size  # paddle Group: property
         self.allow_hybrid_mode = allow_hybrid_mode
         self.allow_multiple_reduction = allow_multiple_reduction
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
@@ -307,7 +317,7 @@ class EPBuffer(BufferBase):
                 allow_hybrid_mode, allow_multiple_reduction)
 
         if os.environ.get('EP_BUFFER_DEBUG', 0):
-            print(f'Initializing EP buffer with {num_bytes} bytes at rank EP {group.rank()}/{group.size()}')
+            print(f'Initializing EP buffer with {num_bytes} bytes at rank EP {group.rank}/{group.world_size}')
         self.num_bytes = num_bytes
 
         # Load balance configs
@@ -359,7 +369,7 @@ class EPBuffer(BufferBase):
 
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
-        group.barrier()
+        dist.barrier(group)  # paddle: no Group.barrier()
         torch.cuda.synchronize()
 
     def destroy(self) -> None:

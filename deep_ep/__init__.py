@@ -48,7 +48,11 @@ def init_jit():
     # noinspection PyUnresolvedReferences
     import deep_ep._C as _C
     library_root_path = os.path.dirname(os.path.abspath(__file__))
-    _C.init_jit(library_root_path, find_nccl_root())
+    # NOTE: pass Paddle's include root so the runtime JIT (deep_jit) nvcc can
+    # resolve the torch-compat headers (<ATen/cuda/CUDAContext.h> etc.) that the kernels include.
+    import paddle
+    paddle_include_root = paddle.sysconfig.get_include()
+    _C.init_jit(library_root_path, find_nccl_root(), paddle_include_root)
 
 
 # Run initialization

@@ -1,4 +1,39 @@
-# DeepEP
+# DeepEP ❤️ PaddlePaddle
+
+> [!NOTE]
+>
+> This repo is a fork of the original DeepEP (V2.5) project, with modifications to enhance
+> compatibility and integration with PaddlePaddle. It targets Blackwell GPUs (sm_103).
+>
+> **Installation**
+>
+> ```bash
+> # 1. Install PaddlePaddle (GPU) with the torch-compat layer (`paddle.enable_compat`).
+> #    See https://www.paddlepaddle.org.cn/install/quick
+> pip install paddlepaddle-gpu
+>
+> # 2. Clone and initialize the DeepJIT submodule (runtime kernel compilation)
+> git submodule update --init --recursive
+>
+> # 3. DeepEP V2.5 needs NCCL >= 2.32.3 (new GIN device API). If the system NCCL is older,
+> pip install "nvidia-nccl-cu13>=2.32.3" 
+>
+> # 4. Build the extension (uses Paddle's cpp_extension)
+> python setup.py build
+> ```
+>
+> **Usage**
+>
+> ```python
+> import paddle
+> paddle.enable_compat()   # MUST be called before importing torch / deep_ep
+> import torch
+> import deep_ep
+> # use deep_ep
+> ```
+
+The original README.md content is as follows:
+---
 
 DeepEP (DeepEveryParallel) is a high-performance communication library for machine learning training and inference. It provides high-throughput and low-latency expert-parallel (EP) all-to-all GPU kernels for MoE dispatch and combine, including FP8 dispatch, and NVLink weight and gradient exchange for redundant experts. It also offers experimental primitives for pipeline parallelism (PP), context parallelism (CP), data parallelism (DP), and remote memory access (Engram). Communication kernels are compiled at runtime via [DeepJIT](https://github.com/deepseek-ai/DeepJIT), with the supporting extension built during installation.
 

@@ -77,7 +77,13 @@ class CustomBuildPy(build_py):
 if __name__ == '__main__':
     nccl_root_dir = find_pkgs.find_nccl_root()
 
-    cxx_flags = ['-std=c++20', '-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
+    # Define PADDLE_WITH_CUDA for the C++ compiler. The Paddle headers we include for
+    # communicator reuse (process_group_nccl.h / nccl_comm_context.h) gate GPUContext,
+    # CUDAStream, and gpuStream_t behind this macro, but Paddle's cpp_extension does not
+    # pass it to the C++ flags, so those types would otherwise be invisible.
+    cxx_flags = ['-std=c++20', '-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable',
+                 '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes',
+                 '-DPADDLE_WITH_CUDA']
     sources = ['csrc/python_api.cpp',
                'csrc/kernels/comm/context.cpp',
                'csrc/kernels/driver/driver.cpp']
