@@ -22,6 +22,13 @@ int64_t create_nccl_comm(const pybind11::bytearray& root_unique_id_bytes,
 
 void destroy_nccl_comm(const int64_t& nccl_comm);
 
+// borrow Paddle ProcessGroupNCCL's communicator by group id.
+int64_t get_nccl_comm_from_group(const int& context_ring_id);
+
+// point current-device GPUContext allocator at `stream` (replaces
+// torch's setCurrentCUDAStream for the allocate-on-comm-stream path).
+void set_compute_allocator_stream(cudaStream_t stream);
+
 std::tuple<int, int> get_physical_domain_size(const int64_t& nccl_comm);
 
 std::tuple<int, int> get_logical_domain_size(const int64_t& nccl_comm, const bool& allow_hybrid_mode);

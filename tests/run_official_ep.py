@@ -19,7 +19,7 @@ paddle.enable_compat()
 
 import torch  # noqa: E402 
 
-import tests.elastic.test_ep as tep  # noqa: E402
+import tests.ep.test_ep as tep  # noqa: E402 
 
 
 def _fleet_init_dist(local_rank: int, num_local_ranks: int, seed: int = 0):
@@ -56,6 +56,9 @@ def main():
     parser.add_argument('--num-topk', type=int, default=8)
     parser.add_argument('--num-experts', type=int, default=16)
     parser.add_argument('--num-sms', type=int, default=0)
+    parser.add_argument('--unbalanced-ratio', type=float, default=1.0)
+    parser.add_argument('--precise-unbalanced-ratio', action='store_true')
+    parser.add_argument('--masked-ratio', type=float, default=0.0)
     args, _ = parser.parse_known_args()
 
     if args.pressure_iters > 0:
@@ -69,16 +72,16 @@ def main():
 
     defaults = dict(
         num_processes=2, num_sms=args.num_sms, num_qps=0, num_allocated_qps=0,
-        num_gpu_timeout_secs=100, num_cpu_timeout_secs=100, sl_idx=0,
+        num_gpu_timeout_secs=100, num_cpu_timeout_secs=100,
         num_tokens=args.num_tokens, hidden=args.hidden,
         num_topk=args.num_topk, num_experts=args.num_experts,
-        do_cpu_sync=1, allow_hybrid_mode=1, allow_multiple_reduction=1,
+        do_cpu_sync=1, defer_epilogue=1, allow_hybrid_mode=1, allow_multiple_reduction=1,
         prefer_overlap_with_compute=0, deterministic=args.deterministic,
         seed=0, skip_check=False, skip_perf_test=args.skip_perf_test,
-        do_pressure_test=args.do_pressure_test, reuse_elastic_buffer=False,
-        test_first_only=args.test_first_only, unbalanced_ratio=1.0,
-        precise_unbalanced_ratio=False, masked_ratio=0.0,
-        dump_profile_traces='', ignore_local_traffic=False,
+        do_pressure_test=args.do_pressure_test, reuse_buffer=False,
+        test_first_only=args.test_first_only, unbalanced_ratio=args.unbalanced_ratio,
+        precise_unbalanced_ratio=args.precise_unbalanced_ratio, masked_ratio=args.masked_ratio,
+        dump_profile_traces='', ignore_local_traffic=False, fp8_dispatch_only=False,
     )
     for k, v in defaults.items():
         setattr(args, k, v)
@@ -87,7 +90,7 @@ def main():
 
     if int(os.getenv('EP_BF16_ONLY', '0')):
         _orig_enum = tep.enumerate_ep_modes
-        tep.enumerate_ep_modes = lambda: (m for m in _orig_enum() if m[2] == 0)
+        tep.enumerate_ep_modes = lambda a: (m for m in _orig_enum(a) if m[2] == 0)
 
     world = int(os.environ.get('PADDLE_TRAINERS_NUM', '1'))
     if world > 1:

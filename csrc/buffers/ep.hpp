@@ -145,7 +145,7 @@ public:
         // NOTES: do not allocate tensors upfront!
         const auto compute_stream = stream_control_prologue(previous_event);
         if (allocate_on_comm_stream)
-            at::cuda::setCurrentCUDAStream(comm::get_comm_stream());
+            comm::set_compute_allocator_stream(comm::get_comm_stream().stream());
         return compute_stream;
     }
 
@@ -174,7 +174,7 @@ public:
 
         // Switch back compute stream
         if (allocate_on_comm_stream)
-            at::cuda::setCurrentCUDAStream(compute_stream);
+            comm::set_compute_allocator_stream(compute_stream.stream());
 
         // The CUDA event marking the finishing
         return event;

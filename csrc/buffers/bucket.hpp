@@ -97,7 +97,7 @@ public:
             const auto gathered = torch::empty({num_ranks[i]}, torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA));
             const auto send = torch::full({1}, i, gathered.options());
             NCCL_CHECK(ncclAllGather(send.data_ptr<int>(), gathered.data_ptr<int>(), 1, ncclInt, reinterpret_cast<ncclComm_t>(nccl_comms[i]), stream));
-            EP_HOST_ASSERT(torch::eq(gathered, i).all().item<bool>());
+            EP_HOST_ASSERT(torch::equal(gathered, torch::full({num_ranks[i]}, i, gathered.options())));
         }
         main_context = contexts.front();
         storage = torch::from_blob(

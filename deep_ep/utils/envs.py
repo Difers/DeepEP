@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 import inspect
 import os
@@ -7,6 +9,7 @@ import subprocess
 import torch
 import torch.distributed as dist
 from typing import List, Tuple
+from paddle.distributed.communication.group import Group
 
 # noinspection PyUnresolvedReferences
 import deep_ep._C as _C

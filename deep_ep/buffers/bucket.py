@@ -108,7 +108,7 @@ class BucketSession:
         group = kwargs.get('group')
         group = self.buffer.groups[self.buffer.get_context_idx(group)]
         self._check_group(group)
-        rank_idx, num_ranks = group.rank(), group.size()
+        rank_idx, num_ranks = group.rank, group.world_size
 
         # Extract srcs and dsts
         num_shards = {
@@ -208,7 +208,9 @@ class BucketBuffer(BufferBase):
 
         # Configs
         self.num_bytes = num_bytes
-        self.groups = [group] if isinstance(group, dist.ProcessGroup) else list(group)
+        # NOTE(paddle-compat): a paddle `Group` is not a `dist.ProcessGroup` instance;
+        # distinguish a single group from a sequence by checking for list/tuple instead.
+        self.groups = list(group) if isinstance(group, (list, tuple)) else [group]
         super().__init__(explicitly_destroy)
         self.nccl_comm_handles = [comm.get_nccl_comm_handle(item) for item in self.groups]
 
@@ -218,8 +220,8 @@ class BucketBuffer(BufferBase):
 
         # Create CPP runtime
         self.runtime = _C.BucketBuffer(
-            [item.rank() for item in self.groups],
-            [item.size() for item in self.groups],
+            [item.rank for item in self.groups],
+            [item.world_size for item in self.groups],
             [item.get() for item in self.nccl_comm_handles],
             num_bytes,
             sl_idx,

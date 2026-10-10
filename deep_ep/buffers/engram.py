@@ -51,8 +51,8 @@ class EngramBuffer(BufferBase):
                  num_gpu_timeout_secs: int = 100,
                  explicitly_destroy: bool = False):
         self.group = group
-        self.rank_idx = group.rank()
-        self.num_ranks = group.size()
+        self.rank_idx = group.rank
+        self.num_ranks = group.world_size
         self.num_gpu_bytes = num_gpu_bytes
         self.num_rdma_storage_bytes = num_rdma_storage_bytes
         self.use_cpu_rdma_storage = use_cpu_rdma_storage
@@ -100,7 +100,7 @@ class EngramBuffer(BufferBase):
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
 
         torch.cuda.synchronize()
-        group.barrier()
+        dist.barrier(group)  # paddle: no Group.barrier()
         torch.cuda.synchronize()
 
     def destroy(self) -> None:

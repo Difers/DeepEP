@@ -14,7 +14,8 @@ namespace deep_ep {
 
 inline deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>> jit(nullptr);
 
-inline void init_jit(const std::string& library_root_path, const std::string& nccl_root_path) {
+inline void init_jit(const std::string& library_root_path, const std::string& nccl_root_path,
+                     const std::string& paddle_include_root = "") {
     const auto library_root = std::filesystem::absolute(library_root_path);
     const auto library_include_dir = library_root / "include";
     const auto nccl_include_dir = std::filesystem::absolute(
@@ -26,7 +27,7 @@ inline void init_jit(const std::string& library_root_path, const std::string& nc
         {library_include_dir},
         {"deep_ep/"});
 
-    jit = deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>>([config, nccl_include_dir] {
+    jit = deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>>([config, nccl_include_dir, paddle_include_root] {
         auto runtime = std::make_shared<deep_jit::Runtime<deep_jit::CUDA>>(config);
 
         // Keep the NCCL include path in compiler options so it participates in the cache key.
@@ -35,6 +36,21 @@ inline void init_jit(const std::string& library_root_path, const std::string& nc
         nvcc_flags.emplace_back("--diag-suppress=39,161,174,177,186,940,3012");
         nvcc_flags.emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
         nvcc_flags.emplace_back("-I" + nccl_include_dir.string());
+        // NOTE: the JIT-compiled kernels include <ATen/cuda/CUDAContext.h> etc.,
+        // which resolve to Paddle's torch-compat headers. Unlike the build-time compile (where
+        // paddle.utils.cpp_extension injects these automatically), the runtime nvcc command must
+        // be told where Paddle's compat headers live and must define PADDLE_WITH_CUDA / the ABI.
+        if (not paddle_include_root.empty()) {
+            const auto pi = std::filesystem::absolute(paddle_include_root);
+            const auto compat = pi / "paddle" / "phi" / "api" / "include" / "compat";
+            nvcc_flags.emplace_back("-I" + pi.string());
+            nvcc_flags.emplace_back("-I" + (pi / "third_party").string());
+            nvcc_flags.emplace_back("-I" + compat.string());
+            nvcc_flags.emplace_back("-I" + (compat / "torch" / "csrc" / "api" / "include").string());
+            nvcc_flags.emplace_back("-DPADDLE_WITH_CUDA");
+            nvcc_flags.emplace_back("-D_GLIBCXX_USE_CXX11_ABI=1");
+            nvcc_flags.emplace_back("--expt-relaxed-constexpr");
+        }
         nvcc_flags.emplace_back("-DEP_NUM_TOPK_IDX_BITS=" + std::to_string(EP_NUM_TOPK_IDX_BITS));
         nvcc_flags.emplace_back("-DNCCL_GIN_GDAKI_ENABLE=1");
         nvcc_flags.emplace_back("-DNCCL_GIN_PROXY_ENABLE=0");
