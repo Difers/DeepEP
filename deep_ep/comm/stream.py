@@ -3,7 +3,7 @@ from typing import Any
 import torch
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 
 
 def get_comm_stream(buffer: Any) -> torch.Stream:

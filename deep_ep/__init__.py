@@ -46,7 +46,7 @@ def init_jit():
     Initialize the JIT compilation runtime.
     """
     # noinspection PyUnresolvedReferences
-    import deep_ep._C as _C
+    from . import _C
     library_root_path = os.path.dirname(os.path.abspath(__file__))
     # NOTE: pass Paddle's include root so the runtime JIT (deep_jit) nvcc can
     # resolve the torch-compat headers (<ATen/cuda/CUDAContext.h> etc.) that the kernels include.
@@ -73,7 +73,7 @@ from .buffers.pp import PPBuffer
 from .utils.event import EventOverlap, EventHandle
 
 # noinspection PyUnresolvedReferences
-from deep_ep._C import (
+from ._C import (
     get_num_allocation_alignment,
     get_num_rdma_alignment,
     get_num_tma_alignment,

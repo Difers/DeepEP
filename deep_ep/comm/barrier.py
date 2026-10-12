@@ -1,6 +1,6 @@
 from typing import Any, Optional
 
-import deep_ep._C as _C
+from .. import _C
 
 
 def barrier(buffer: Any, wait_comm_stream: bool = True,

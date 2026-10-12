@@ -6,7 +6,7 @@ from functools import partial
 from typing import Any, Optional, Sequence, Tuple, Union
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 
 from .allocator import BufferAllocator
 from .base import BufferBase
