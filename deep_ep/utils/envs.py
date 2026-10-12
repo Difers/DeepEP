@@ -12,7 +12,7 @@ from typing import List, Tuple
 from paddle.distributed.communication.group import Group
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 
 from .. import comm
 

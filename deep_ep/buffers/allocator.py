@@ -2,7 +2,7 @@ import torch
 from typing import List, Tuple
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 
 from ..utils.math import align
 

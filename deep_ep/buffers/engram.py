@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 
 from .base import BufferBase
 from .. import comm

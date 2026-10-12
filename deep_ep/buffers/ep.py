@@ -6,9 +6,9 @@ import torch.distributed as dist
 from typing import Optional, Sequence, Tuple, Union
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 # noinspection PyUnresolvedReferences
-from deep_ep._C import EventHandle
+from .._C import EventHandle
 
 from .allocator import BufferAllocator
 from .base import BufferBase

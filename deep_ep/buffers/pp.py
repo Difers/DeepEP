@@ -3,7 +3,7 @@ import torch.distributed as dist
 from typing import Optional
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 
 from .base import BufferBase
 from .. import comm

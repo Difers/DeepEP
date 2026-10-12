@@ -6,7 +6,7 @@ import paddle.distributed as dist
 from paddle.distributed.communication.group import Group
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+from .. import _C
 
 
 class NCCLCommHandle:
