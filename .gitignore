@@ -17,6 +17,10 @@ compile_commands.json
 # Build
 build/
 *.so
+.ninja_deps
+.ninja_log
+# Un-registered local clone used by the JIT build
+third-party/fmt/
 deep_ep.egg-info/
 dist/
 # Paddle cpp_extension generated loader stub (pairs with deep_ep/_C_pd_.so)
@@ -25,6 +29,12 @@ deep_ep/_C.py
 # Coredump
 coredump/
 
+# DeepJIT cache
+.dj/
+
 # OpenCode
 .sisyphus/
 AGENTS.md
+build.sitepaddle.bak/
+log/
+*.md

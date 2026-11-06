@@ -243,16 +243,56 @@ def get_nvlink_gbs(factor: float = 0.9) -> float:
 
 
 @functools.lru_cache()
-def check_fast_rdma_atomic_support(nic_name: str = 'mlx5_0') -> bool:
+def get_default_rdma_nic_name() -> str:
+    """
+    Resolve the data-plane RDMA NIC name instead of hard-coding ``mlx5_0``.
+
+    Resolution order:
+      1. first device listed in ``NCCL_IB_HCA`` (strips the leading ``=`` and any ``:port``);
+      2. otherwise the ``ibstat`` CA with the highest port ``Rate``.
+
+    Returns:
+        nic_name: the resolved NIC device name (falls back to ``mlx5_0`` if detection fails).
+    """
+    # noinspection PyBroadException
+    try:
+        hca = os.environ.get('NCCL_IB_HCA', '').lstrip('=').strip()
+        if hca:
+            first = hca.split(',')[0].strip()
+            if first:
+                return first.split(':')[0]
+
+        result = subprocess.run(['ibstat'], capture_output=True, text=True, check=True)
+        best_name, best_rate = None, -1
+        current = None
+        for line in result.stdout.splitlines():
+            ca = re.match(r"CA '(\S+)'", line.strip())
+            if ca:
+                current = ca.group(1)
+                continue
+            rate = re.search(r'Rate:\s*(\d+)', line)
+            if rate and current is not None and int(rate.group(1)) > best_rate:
+                best_rate, best_name = int(rate.group(1)), current
+        if best_name is not None:
+            return best_name
+    except Exception:
+        pass
+    return 'mlx5_0'
+
+
+@functools.lru_cache()
+def check_fast_rdma_atomic_support(nic_name: str = None) -> bool:
     """
     Check whether the NIC supports fast RDMA atomic operations (MT4131 or newer).
 
     Arguments:
-        nic_name: the NIC device name.
+        nic_name: the NIC device name (``None`` auto-detects the data-plane NIC).
 
     Returns:
         supported: `True` if fast RDMA atomics are supported.
     """
+    if nic_name is None:
+        nic_name = get_default_rdma_nic_name()
     # noinspection PyBroadException
     try:
         result = subprocess.run(['ibstat'], capture_output=True, text=True, check=True)
@@ -266,16 +306,28 @@ def check_fast_rdma_atomic_support(nic_name: str = 'mlx5_0') -> bool:
 
 
 @functools.lru_cache()
-def get_rdma_gbs(nic_name: str = 'mlx5_0') -> float:
+def get_rdma_gbs(nic_name: str = None) -> float:
     """
     Get the RDMA bandwidth in GB/s, cached.
 
     Arguments:
-        nic_name: the NIC device name.
+        nic_name: the NIC device name (``None`` auto-detects the data-plane NIC).
 
     Returns:
         gbs: the RDMA bandwidth in GB/s (0 if detection fails).
     """
+    # Allow declaring the true link bandwidth. In a bonded (802.3ad LAG) RDMA
+    # setup, ibstat reports a single member link's rate (e.g. a ConnectX-8 800G
+    # NIC shows 400, 4X NDR) rather than the bonded aggregate, so detection
+    # under-reports. When unset, detection is unchanged.
+    env_gbs = os.environ.get('EP_RDMA_GBS')
+    if env_gbs:
+        try:
+            return float(env_gbs)
+        except Exception:
+            pass
+    if nic_name is None:
+        nic_name = get_default_rdma_nic_name()
     # noinspection PyBroadException
     try:
         result = subprocess.run(['ibstat'], capture_output=True, text=True, check=True)

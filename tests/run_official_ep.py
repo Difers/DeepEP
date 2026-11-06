@@ -46,6 +46,9 @@ def _init_dist_env(world_size, seed=20):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--skip-perf-test', action='store_true')
+    parser.add_argument('--skip-check', action='store_true')
+    parser.add_argument('--no-hybrid', action='store_true',
+                        help='use direct RDMA kernels instead of the hybrid forwarder path')
     parser.add_argument('--test-first-only', action='store_true')
     parser.add_argument('--do-pressure-test', action='store_true')
     parser.add_argument('--deterministic', action='store_true')
@@ -56,6 +59,9 @@ def main():
     parser.add_argument('--num-topk', type=int, default=8)
     parser.add_argument('--num-experts', type=int, default=16)
     parser.add_argument('--num-sms', type=int, default=0)
+    parser.add_argument('--num-allocated-qps', type=int, default=0)
+    parser.add_argument('--ignore-local-traffic', action='store_true',
+                        help='exclude the intra-node scaleout group from the SO bandwidth figure')
     parser.add_argument('--unbalanced-ratio', type=float, default=1.0)
     parser.add_argument('--precise-unbalanced-ratio', action='store_true')
     parser.add_argument('--masked-ratio', type=float, default=0.0)
@@ -71,17 +77,19 @@ def main():
         tep.range = _capped_range  
 
     defaults = dict(
-        num_processes=2, num_sms=args.num_sms, num_qps=0, num_allocated_qps=0,
+        num_processes=2, num_sms=args.num_sms, num_qps=0,
+        num_allocated_qps=args.num_allocated_qps,
         num_gpu_timeout_secs=100, num_cpu_timeout_secs=100,
         num_tokens=args.num_tokens, hidden=args.hidden,
         num_topk=args.num_topk, num_experts=args.num_experts,
-        do_cpu_sync=1, defer_epilogue=1, allow_hybrid_mode=1, allow_multiple_reduction=1,
+        do_cpu_sync=1, defer_epilogue=1,
+        allow_hybrid_mode=0 if args.no_hybrid else 1, allow_multiple_reduction=1,
         prefer_overlap_with_compute=0, deterministic=args.deterministic,
-        seed=0, skip_check=False, skip_perf_test=args.skip_perf_test,
+        seed=0, skip_check=args.skip_check, skip_perf_test=args.skip_perf_test,
         do_pressure_test=args.do_pressure_test, reuse_buffer=False,
         test_first_only=args.test_first_only, unbalanced_ratio=args.unbalanced_ratio,
         precise_unbalanced_ratio=args.precise_unbalanced_ratio, masked_ratio=args.masked_ratio,
-        dump_profile_traces='', ignore_local_traffic=False, fp8_dispatch_only=False,
+        dump_profile_traces='', ignore_local_traffic=args.ignore_local_traffic, fp8_dispatch_only=False,
     )
     for k, v in defaults.items():
         setattr(args, k, v)
@@ -89,8 +97,9 @@ def main():
     tep.init_dist = _fleet_init_dist
 
     if int(os.getenv('EP_BF16_ONLY', '0')):
+        # Mode tuple is (expert_alignment, use_fp8_dispatch, num_bias, ...), so BF16 means `m[1] == 0`.
         _orig_enum = tep.enumerate_ep_modes
-        tep.enumerate_ep_modes = lambda a: (m for m in _orig_enum(a) if m[2] == 0)
+        tep.enumerate_ep_modes = lambda a: (m for m in _orig_enum(a) if m[1] == 0)
 
     world = int(os.environ.get('PADDLE_TRAINERS_NUM', '1'))
     if world > 1:
