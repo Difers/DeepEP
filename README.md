@@ -3,7 +3,7 @@
 > [!NOTE]
 >
 > This repo is a fork of the original DeepEP (V2.5) project, with modifications to enhance
-> compatibility and integration with PaddlePaddle. It targets Blackwell GPUs (sm_103).
+> compatibility and integration with PaddlePaddle. 
 >
 > **Installation**
 >
@@ -31,6 +31,33 @@
 > import deep_ep
 > # use deep_ep
 > ```
+
+> **Tests**
+>
+> ```bash
+> # Single node, 8 GPUs
+> bash tests/run_ep8.sh tests/run_official_ep.py
+> bash tests/run_ep8.sh tests/run_official_ep.py --deterministic>
+> # Two nodes, 16 GPUs (run from the first node)
+> bash tests/run_ep16.sh <nodeA> <nodeB> tests/run_official_ep.py
+> ```
+>
+> The upstream tests use `torch.multiprocessing.spawn`, which Paddle has no equivalent of, so they
+> run through two thin runners instead: `tests/run_official_ep.py` for `tests/ep/test_ep.py`, and
+> `tests/run_mod.py <test_file>` for every other module. Both install a fleet-based `init_dist` and
+> take the device index from `FLAGS_selected_gpus`.
+>
+> `run_ep8.sh` clears any `PADDLE_*` topology exported by a cluster scheduler, which would
+> otherwise make `paddle.distributed.launch` try to reach the other nodes. `--gpus` must start at 0
+> and be contiguous, since `local_rank` is used directly as the device index.
+>
+> `run_ep16.sh` drives both nodes from a single `mpirun`, exchanging the `PADDLE_*` endpoints
+> through the rendezvous directory `EP_RV_DIR`, which has to be visible from both nodes.
+>
+> If NCCL is kept outside the location Python would find by default, point both scripts at it with
+> `EP_NCCL_PKG_ROOT=<dir containing nvidia/nccl>`. That directory must come first on `PYTHONPATH`,
+> since torch resolves its NCCL package through `sys.path`, and mixing two NCCL runtimes in one
+> process crashes once Paddle creates a communicator.
 
 The original README.md content is as follows:
 ---

@@ -4,7 +4,10 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-_MPI = 'OMPI_COMM_WORLD_RANK' in os.environ
+# NOTES: `EP_RV_DIR` is what the two-node mpirun launcher sets, and it is also what tells this
+# run apart from one that merely inherited `OMPI_*` from whatever started it (aq's remote
+# launcher does), where `paddle.distributed.launch` already published the endpoints
+_MPI = 'OMPI_COMM_WORLD_RANK' in os.environ and bool(os.environ.get('EP_RV_DIR'))
 if _MPI:
     from tests.mpi_bootstrap import setup_paddle_env
     setup_paddle_env()
