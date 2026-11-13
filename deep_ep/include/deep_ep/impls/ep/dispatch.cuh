@@ -100,6 +100,8 @@ dispatch_impl(
                 atomicAdd_block(expert_count + dst_expert_idx, 1);
 
             // Rank choice should do deduplication here
+            // NOTES: the deterministic prologue's `is_unique` must count exactly the same entries,
+            // since these counts become the receive-side prefix sums that its slots index into
             const auto dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
             if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
                 atomicAdd_block(rank_count + dst_rank_idx, 1);

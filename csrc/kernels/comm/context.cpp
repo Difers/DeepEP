@@ -242,9 +242,12 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
     // all RDMA writes to this window and costs ~6x dispatch/combine bandwidth on hybrid
     // inter-node EP. The hazard does not arise when PCIe native atomics are not in use (e.g.
     // PCI_ATOMIC_MODE=0), where relaxed ordering is both faster and, in our testing, correct.
-    // Keep strict as the default; opt into NCCL_WIN_DEFAULT via EP_RELAXED_WIN_ORDERING=1 on
-    // such platforms.
-    const int main_win_flags = get_env<int>("EP_RELAXED_WIN_ORDERING", 0) ? NCCL_WIN_DEFAULT : NCCL_WIN_STRICT_ORDERING;
+    // NOTE (Paddle): we default to NCCL_WIN_DEFAULT (relaxed), unlike upstream. Strict ordering is
+    // not a sensible deployment configuration here -- it costs several times the internode
+    // dispatch time -- and the platforms we target run PCI_ATOMIC_MODE=0, where the hazard cannot
+    // occur. Set EP_RELAXED_WIN_ORDERING=0 to restore upstream's strict behaviour, which is what
+    // a platform using PCIe native atomics (PCI_ATOMIC_MODE=4) must do.
+    const int main_win_flags = get_env<int>("EP_RELAXED_WIN_ORDERING", 1) ? NCCL_WIN_DEFAULT : NCCL_WIN_STRICT_ORDERING;
     NCCL_CHECK(ncclCommWindowRegister(comm, raw_window_ptr, symmetric_memory->num_sym_bytes, &window, main_win_flags));
     NCCL_CHECK(ncclGetLsaDevicePointer(window, 0, nvl_rank_idx, &workspace));
     buffer = math::advance_ptr(workspace, num_workspace_bytes);

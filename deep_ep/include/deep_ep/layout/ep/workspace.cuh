@@ -18,6 +18,8 @@ struct alignas(kNumRDMAAlignmentBytes) EPSignals {
     int scaleout_rank_expert_count[2][kNumMaxRanks + kNumMaxExperts];
     int64_t scaleout_channel_signaled_tail[kNumMaxChannels][kNumMaxRanks];
     int channel_scaleup_tail[kNumMaxChannels][kNumMaxRanks];
+    // Per-source-rank received token counts, used by the hybrid deterministic mode only
+    int deterministic_src_rank_count[kNumMaxRanks];
     int lb_chunk_idx_counter;
 };
 EP_STATIC_ASSERT(sizeof(EPSignals) <= kNumMaxSignalBytes, "Too many signals");
@@ -116,6 +118,14 @@ struct EPWorkspaceLayout {
 
     __forceinline__ __device__ __host__ int* get_lb_chunk_idx_counter_ptr() const {
         return &signals.lb_chunk_idx_counter;
+    }
+
+    // Per-source-rank received token counts, used by the hybrid deterministic mode only.
+    // Row `scaleup_rank_idx * num_scaleout_ranks + scaleout_rank_idx` belongs to that source
+    // rank, which matches the row-form traversal order of the dispatch copy epilogue.
+    __forceinline__ __device__ __host__ int* get_deterministic_src_rank_count_ptr(
+        const int& row_idx = 0) const {
+        return signals.deterministic_src_rank_count + row_idx;
     }
 };
 

@@ -475,6 +475,21 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                 ref_count = sum(ref_num_recv_tokens_per_rank[i::num_scaleup_ranks])
                 assert count == ref_count, f'{ref_count=}, {count=}'
 
+            # Check the per-source-rank psum appended by the row-form deterministic dispatch.
+            # NOTES: its rows are scale-up-major (`scaleup * num_scaleout_ranks + scaleout`), which is
+            # the transpose of the global rank index, so the reference has to be read through that map
+            num_ranks = buffer.num_ranks
+            if len(psum_num_recv_tokens_per_scaleup_rank_list) == 1 + num_scaleup_ranks + num_ranks:
+                for i in range(num_ranks):
+                    # NOTES: the appended segment is a prefix sum of its own, so its first row has no
+                    # predecessor to subtract -- the element just before it is the first segment's total
+                    idx = num_scaleup_ranks + i
+                    count = psum_num_recv_tokens_per_scaleup_rank_list[idx + 1] - (
+                        psum_num_recv_tokens_per_scaleup_rank_list[idx] if i > 0 else 0)
+                    src_rank_idx = (i % num_scaleout_ranks) * num_scaleup_ranks + i // num_scaleout_ranks
+                    ref_count = int(ref_num_recv_tokens_per_rank[src_rank_idx])
+                    assert count == ref_count, f'{i=}, {src_rank_idx=}, {ref_count=}, {count=}'
+
             # Check dispatch data
             for check_recv_x, check_recv_topk_idx, check_recv_topk_weights, check_handle in (
                 (expanded_recv_x, None, expanded_recv_topk_weights, expanded_handle),  # Expanded

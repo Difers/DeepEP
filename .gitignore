@@ -35,6 +35,5 @@ coredump/
 # OpenCode
 .sisyphus/
 AGENTS.md
-build.sitepaddle.bak/
 log/
 *.md

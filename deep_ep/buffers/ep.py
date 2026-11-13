@@ -42,8 +42,16 @@ class EPHandle:
             Tensors created in inference mode have no version counter and cannot be checked.
         psum_num_recv_tokens_per_scaleup_rank: inclusive prefix sum of deduplicated received token counts
             per scaleup rank, shape `[num_scaleup_ranks]`. A token is counted once per rank even if
-            multiple of its top-k experts land on the same rank. The last element equals the total number
-            of received tokens.
+            multiple of its top-k experts land on the same rank. The element at `num_scaleup_ranks - 1`
+            equals the total number of received tokens.
+            The hybrid deterministic dispatch extends the shape to `[num_scaleup_ranks + num_ranks]`,
+            appending the same prefix sum broken down per source rank, indexed scale-up-major:
+            row `scaleup_rank_idx * num_scaleout_ranks + scaleout_rank_idx`. Its last element is
+            the same total.
+            NOTES: that is the transpose of the global rank index used everywhere else
+            (`scaleout_rank_idx * num_scaleup_ranks + scaleup_rank_idx`). The order is forced by
+            the receive buffer layout (scale-up segment outer, scale-out row inner), which is what
+            lets the copy epilogue walk it in a single monotonic pass.
         psum_num_recv_tokens_per_expert: prefix sum of alignment-padded received token counts per local
             expert, shape `[num_local_experts]`. Each expert's count is padded to `expert_alignment`.
             In non-expand mode, this is the inclusive prefix sum. In expand mode, `psum[i]` equals
@@ -143,6 +151,8 @@ class EPHandle:
         sort_keys = self.cached_recv_src_metadata_before_sort[:, 0]
 
         # Ignore trailing tokens by setting their `sort_keys` to max
+        # NOTES: this sorting epilogue is only used by the expand layout, which never enables the
+        # row-form dispatch, so the last element is still the per-scale-up-rank total here
         num_recv_tokens = self.psum_num_recv_tokens_per_scaleup_rank[-1] if not do_cpu_sync else self.recv_src_metadata.shape[0]
         if not do_cpu_sync:
             oob_tokens_mask = torch.arange(0, self.recv_src_metadata.shape[0], device=self.recv_src_metadata.device) >= num_recv_tokens
@@ -350,6 +360,7 @@ class EPBuffer(BufferBase):
             self.rank_idx, self.num_ranks,
             self.nccl_comm_handle.get(), num_bytes, num_lb_bytes,
             allow_hybrid_mode, allow_multiple_reduction, prefer_overlap_with_compute,
+            deterministic,
             sl_idx, num_allocated_qps,
             num_cpu_timeout_secs, num_gpu_timeout_secs,
             self.explicitly_destroy)
@@ -578,6 +589,7 @@ class EPBuffer(BufferBase):
                  num_max_tokens_per_rank: Optional[int] = None,
                  expert_alignment: Optional[int] = None,
                  num_sms: int = 0, num_qps: int = 0,
+                 num_prologue_sms: int = 0,
                  previous_event: Optional[EventHandle] = None,
                  async_with_compute_stream: bool = False,
                  allocate_on_comm_stream: bool = False,
@@ -614,6 +626,9 @@ class EPBuffer(BufferBase):
             expert_alignment: align the number of tokens received by each local expert to this variable.
             num_sms: the number of SMs to use (0 for automatic via `get_theoretical_num_sms`).
             num_qps: the number of RDMA QPs to use (0 for automatic via `get_theoretical_num_qps`).
+            num_prologue_sms: the number of SMs for the deterministic prologue kernel
+                (0 for automatic: at most 64 SMs). Only used when the kernel-side deterministic
+                path applies (see `deterministic` in the constructor).
             previous_event: the event to wait before actually executing the kernel.
                 If set, `allocate_on_comm_stream` must also be `True`.
             async_with_compute_stream: the current stream will not wait for the communication kernels to be
@@ -701,6 +716,7 @@ class EPBuffer(BufferBase):
                                                                  num_max_tokens_per_rank,
                                                                  num_experts, expert_alignment,
                                                                  num_sms, num_qps,
+                                                                 num_prologue_sms,
                                                                  previous_event,
                                                                  async_with_compute_stream, allocate_on_comm_stream,
                                                                  do_cpu_sync, do_expand,
@@ -741,7 +757,11 @@ class EPBuffer(BufferBase):
                               channel_linked_list) if handle is None else handle
 
             # Do deterministic
-            if self.deterministic:
+            # The kernel-side path (the prologue pre-computes every destination slot) already makes
+            # the non-expand layout reproducible, so the sort is only needed for the expanded one,
+            # whose output rows are still assigned with atomics
+            # NOTES: must stay in sync with `use_deterministic_kernel` in `csrc/buffers/ep.hpp`
+            if self.deterministic and do_expand:
                 deterministic_epilogue = functools.partial(
                     handle.deterministic_sort,
                     do_cpu_sync, is_cached_dispatch,

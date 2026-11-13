@@ -12,7 +12,7 @@
 namespace deep_ep::ep {
 
 template <bool kDoCPUSync,
-          bool kReuseSlotIndices,
+          bool kCachedMode, bool kDeterministic,
           int kNumSMs,
           int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -39,6 +39,7 @@ hybrid_dispatch_impl(
     int* psum_num_recv_tokens_per_expert,
     int* num_unaligned_recv_tokens_per_expert,
     int* dst_buffer_slot_idx,
+    int* deterministic_slot_idx,
     int* token_metadata_at_forward,
     const int num_tokens,
     const int sf_token_stride, const int sf_hidden_stride,
@@ -49,6 +50,13 @@ hybrid_dispatch_impl(
     const int scaleout_rank_idx, const int scaleup_rank_idx) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
+    // The cached mode replays a recorded slot table, while the deterministic mode replays the
+    // one pre-computed by `dispatch_deterministic_prologue`; both bypass the atomic slot race
+    constexpr bool kReuseSlotIndices = kCachedMode or kDeterministic;
+    // The reverse metadata (and the linked list) is only built when it is not already available,
+    // which the deterministic mode still needs so that a later cached dispatch can replay it
+    constexpr bool kBuildReverseMeta = not kCachedMode;
+    EP_STATIC_ASSERT(not (kCachedMode and kDeterministic), "Invalid slot index source");
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
@@ -129,6 +137,8 @@ hybrid_dispatch_impl(
                 atomicAdd_block(expert_count + dst_expert_idx, 1);
 
             // Rank choice should do deduplication here
+            // NOTES: the deterministic prologue's `is_unique` must count exactly the same entries,
+            // since these counts become the receive-side prefix sums that its slots index into
             const auto dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
             if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
                 atomicAdd_block(rank_count + dst_rank_idx, 1);
@@ -172,7 +182,7 @@ hybrid_dispatch_impl(
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // Issue scaleout writes to peers
-            EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
+            EP_STATIC_ASSERT(kCachedMode or kNumScaleoutRanks <= kNumNotifyThreads,
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
@@ -190,7 +200,8 @@ hybrid_dispatch_impl(
 
             // Util functions to get metadata from scale-out peers
             // NOTES: this is correct as RDMA operations has a minimum write granularity of 1024 bytes (a whole integer write is atomic)
-            const auto recv_and_reduce = [=](const auto& get_ptr_func, const bool& is_expert_reduction = false) -> int {
+            const auto recv_and_reduce = [=](const auto& get_ptr_func, const bool& is_expert_reduction,
+                                             const auto& on_value) -> int {
                 int count = 0;
                 #pragma unroll
                 for (int j = 0; j < kNumScaleoutRanks; ++ j) {
@@ -212,11 +223,15 @@ hybrid_dispatch_impl(
                         return false;
                     });
 
+                    // Publish the per-scale-out-peer detail before it is folded into the sum
+                    on_value(j, decoded);
+
                     // Add and clean for next usages
                     count += decoded, *ptr = 0;
                 }
                 return count;
             };
+            const auto no_op_on_value = [](const int&, const int&) {};
 
             // Write into all scale-up peers' rank-level counters
             #pragma unroll
@@ -224,6 +239,15 @@ hybrid_dispatch_impl(
                 // Wait scale-out arrival and reduce
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_peer_idx, i);
+                }, false, [=](const int& scaleout_peer_idx, const int& decoded) {
+                    // The deterministic mode needs the counts split by source rank, since every
+                    // source rank owns a private row in the destination's scale-up buffer
+                    if constexpr (kDeterministic) {
+                        gin.put_value<ncclTeamTagLsa>(
+                            workspace_layout.get_deterministic_src_rank_count_ptr(
+                                scaleup_rank_idx * kNumScaleoutRanks + scaleout_peer_idx),
+                            math::encode_decode_positive(decoded), i);
+                    }
                 });
 
                 // Write into the remote scale-up peer
@@ -240,7 +264,7 @@ hybrid_dispatch_impl(
                 // Wait scale-out arrival and reduce
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, i);
-                }, true);
+                }, true, no_op_on_value);
 
                 // Write into the remote scale-up peer
                 const int64_t counter = (1ll << 32ll) | count;
@@ -297,6 +321,38 @@ hybrid_dispatch_impl(
                 }
                 return false;
             });
+
+            // Wait for the per-source-rank details (deterministic mode only)
+            // NOTES: every entry is written by exactly one scale-up peer, so a per-entry
+            // encoded-readiness marker is enough
+            // The notify shared memory is sized for the global counts used above
+            // (`kNumRanks + kNumExperts`), while from here on only the local ones are live
+            // (`kNumScaleupRanks + kNumExpertsPerRank`), so the source rows are appended into
+            // the slack left behind
+            int* src_rank_count = rank_expert_count + kNumScaleupRanks + kNumExpertsPerRank;
+            if constexpr (kDeterministic) {
+                EP_STATIC_ASSERT(kNumScaleupRanks + kNumExpertsPerRank + kNumRanks <= kNumAlignedElems,
+                                 "Insufficient notify shared memory");
+                for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+                    const auto ptr = workspace_layout.get_deterministic_src_rank_count_ptr(i);
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        const auto decoded = math::encode_decode_positive(ptx::ld_acquire_sys<int>(ptr));
+                        if (math::is_decoded_positive_ready(decoded)) {
+                            // Clean for the next usage and save for the prefix sum below
+                            *ptr = 0;
+                            src_rank_count[i] = decoded;
+                            return true;
+                        }
+
+                        if (is_last_check) {
+                            printf("DeepEP hybrid notify (deterministic source-rank detail) timeout, "
+                                   "scale-out: %d/%d, scale-up: %d/%d, source row: %d\n",
+                                   scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks, i);
+                        }
+                        return false;
+                    });
+                }
+            }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // Do prefix sum by the warps of the first SM
@@ -324,6 +380,13 @@ hybrid_dispatch_impl(
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
+            } else if constexpr (kDeterministic) {
+                // Inclusive prefix sum over the source rows, appended right after the
+                // per-scale-up-rank prefix sums
+                // NOTES: the deterministic mode is never cached, so the notify warps always exist
+                EP_STATIC_ASSERT(kNumNotifyWarps >= 3, "Insufficient notify warps");
+                if (warp_idx == 2)
+                    do_psum(src_rank_count, psum_num_recv_tokens_per_scaleup_rank + kNumScaleupRanks, kNumRanks, 0);
             }
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
@@ -396,6 +459,14 @@ hybrid_dispatch_impl(
                 tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
                 if (topk_weights != nullptr)
                     tma_buffer.get_topk_weights_ptr()[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+
+                // Carry the pre-computed destination slots to the forwarding rank
+                // NOTES: the linked-list index field is unused on this hop, so it is reused as
+                // the slot channel; the forwarding rank consumes it before overwriting the field
+                if constexpr (kDeterministic) {
+                    tma_buffer.get_linked_list_idx_ptr()[lane_idx] =
+                        __ldg(deterministic_slot_idx + token_idx * kNumTopk + lane_idx);
+                }
             }
             __syncwarp();
 
@@ -556,6 +627,31 @@ hybrid_dispatch_impl(
                 stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
                     dst_expert_idx / kNumExpertsPerRank : -1;
 
+                // Resolve the destination slots
+                // NOTES: must happen before the linked-list index is written below, which
+                // overwrites the very packet field carrying the deterministic slots
+                int stored_dst_slot_idx = -1;
+                const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
+                    recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
+                if constexpr (kDeterministic) {
+                    // Pre-computed by `dispatch_deterministic_prologue` on the source rank
+                    // NOTES: the prologue deduplicates over all global ranks, so the packet also
+                    // carries slots for the top-k entries whose experts live in other scale-out
+                    // groups. Those entries have no local scale-up destination here, and consuming
+                    // their slots would resolve a symmetric pointer with rank `-1` below.
+                    if (lane_idx < kNumTopk and stored_dst_scaleup_rank_idx >= 0)
+                        stored_dst_slot_idx = tma_buffer.get_linked_list_idx_ptr()[lane_idx];
+                } else if constexpr (kCachedMode) {
+                    // Replay the slots recorded during forward
+                    if (lane_idx < kNumTopk)
+                        stored_dst_slot_idx = __ldg(dst_slot_idx_ptr + lane_idx);
+                } else {
+                    // Deduplicate for NVLink ranks
+                    if (ptx::deduplicate(stored_dst_scaleup_rank_idx, lane_idx) and stored_dst_scaleup_rank_idx >= 0)
+                        stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_scaleup_rank_idx, 1);
+                }
+                __syncwarp();
+
                 // Write the per-scaleup channel index for this token
                 int linked_list_idx = -1;
                 #pragma unroll
@@ -566,23 +662,9 @@ hybrid_dispatch_impl(
                         stored_scaleup_send_counters[j], valid ? src_lane_idx : 0);
                     linked_list_idx = valid ? exchanged : linked_list_idx;
                 }
-                if (not kReuseSlotIndices and lane_idx < kNumTopk) {
+                if (kBuildReverseMeta and lane_idx < kNumTopk) {
                     tma_buffer.get_linked_list_idx_ptr()[lane_idx] = transform_linked_list_idx(linked_list_idx);
                     ptx::tma_store_fence();
-                }
-                __syncwarp();
-
-                // Deduplicate for scale-up ranks
-                int stored_dst_slot_idx = -1;
-                const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
-                    recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
-                if constexpr (kReuseSlotIndices) {
-                    if (lane_idx < kNumTopk)
-                        stored_dst_slot_idx = __ldg(dst_slot_idx_ptr + lane_idx);
-                } else {
-                    // Deduplicate for NVLink ranks
-                    if (ptx::deduplicate(stored_dst_scaleup_rank_idx, lane_idx) and stored_dst_scaleup_rank_idx >= 0)
-                        stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_scaleup_rank_idx, 1);
                 }
                 __syncwarp();
 
@@ -607,7 +689,7 @@ hybrid_dispatch_impl(
                     stored_scaleup_send_counters[j] += (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
 
                 // Record metadata at forward
-                if constexpr (not kReuseSlotIndices) {
+                if constexpr (kBuildReverseMeta) {
                     EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of selections");
                     const auto metadata_ptr = token_metadata_at_forward +
                         num_tokens_processed * kNumForwardMetadataDims;
@@ -619,6 +701,8 @@ hybrid_dispatch_impl(
                     }
 
                     // Second, original top-k indices and destination slots
+                    // NOTES: the slot table is recorded in the deterministic mode as well, so
+                    // that a later cached dispatch can replay the very same placement
                     if (lane_idx < kNumTopk) {
                         metadata_ptr[2 + lane_idx] = stored_dst_scaleup_rank_idx;
                         metadata_ptr[2 + kNumTopk + lane_idx] = stored_dst_slot_idx;
@@ -631,12 +715,12 @@ hybrid_dispatch_impl(
         }
 
         // Assign the source token index part of the metadata into `-1` as an ending mark
-        if (not kReuseSlotIndices and ptx::elect_one_sync())
+        if (kBuildReverseMeta and ptx::elect_one_sync())
             token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
         __syncwarp();
 
         // Update linked list's ending position
-        if constexpr (not kReuseSlotIndices) {
+        if constexpr (kBuildReverseMeta) {
             const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {

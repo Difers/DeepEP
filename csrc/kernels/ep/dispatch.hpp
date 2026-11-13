@@ -28,6 +28,51 @@ static layout::TokenLayout get_dispatch_token_layout(
     return layout::TokenLayout(hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
 }
 
+// Pre-computes the destination slot of every `(token, top-k)` entry, so that the dispatch
+// placement becomes a pure function of `topk_idx` instead of depending on the atomic race
+static void launch_dispatch_deterministic_prologue(topk_idx_t* topk_idx, int* rank_count_buffer,
+                                                   int* dst_buffer_slot_idx,
+                                                   const int& num_tokens, const int& num_max_tokens_per_rank,
+                                                   const int& num_experts, const int& num_topk,
+                                                   const int& row_base_idx, const int& num_ranks,
+                                                   const int& num_sms, const int& num_smem_bytes,
+                                                   const at::cuda::CUDAStream& stream) {
+    constexpr int num_warps = 8;
+    constexpr int num_threads = num_warps * 32;
+    EP_HOST_ASSERT(num_sms > 0 and num_sms <= jit->device.get_num_sms());
+
+    // The kernel only needs its reduction scratch `[global psum | per-warp sums | per-warp psums]`,
+    // which is orders of magnitude smaller than the dispatch budget `num_smem_bytes`
+    // NOTES: request exactly that rather than the whole budget, so that the launch does not depend
+    // on the full opt-in dynamic shared memory limit being grantable for this block shape
+    const int64_t num_prologue_smem_bytes =
+        static_cast<int64_t>(2 * num_warps + 1) * num_ranks * static_cast<int64_t>(sizeof(int));
+    EP_HOST_ASSERT(num_prologue_smem_bytes <= num_smem_bytes and "Insufficient shared memory");
+
+    // Compile
+    const auto kernel = jit->compile("dispatch_deterministic_prologue", std::format(R"(
+#include <deep_ep/impls/ep/dispatch_deterministic_prologue.cuh>
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_deterministic_prologue_impl<{}, {}, {}, {}, {}, {}>);
+}}
+)", num_sms, num_warps, num_ranks, num_max_tokens_per_rank, num_experts, num_topk));
+
+    // Launch
+    const auto options = deep_jit::cuda::LaunchOptions {
+        .stream = stream.stream(),
+        .num_smem_bytes = static_cast<int>(num_prologue_smem_bytes),
+        .grid_dim = dim3(num_sms, 1, 1),
+        .block_dim = dim3(num_threads, 1, 1),
+        .cooperative = true,
+    };
+    jit->launch(
+        kernel, options,
+        topk_idx, rank_count_buffer, dst_buffer_slot_idx,
+        num_tokens, row_base_idx
+    );
+}
+
 static void launch_dispatch(void* x, void* sf,
                             topk_idx_t* topk_idx, float* topk_weights,
                             int* cumulative_local_expert_recv_stats,
@@ -35,6 +80,7 @@ static void launch_dispatch(void* x, void* sf,
                             int* psum_num_recv_tokens_per_expert,
                             int* num_unaligned_recv_tokens_per_expert,
                             int* dst_buffer_slot_idx,
+                            int* deterministic_slot_idx,
                             int* token_metadata_at_forward,
                             const int& num_tokens, const int& num_max_tokens_per_rank,
                             const int& hidden, const int& elem_size,
@@ -50,11 +96,17 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_smem_bytes,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
+                            const bool& deterministic,
                             const bool& do_cpu_sync,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats == nullptr);
+
+    // The cached mode replays the recorded slot table, so it takes precedence
+    EP_HOST_ASSERT(not (deterministic and cached_mode));
+    // The hybrid path carries the pre-computed slots inside the forwarded packets
+    EP_HOST_ASSERT(not deterministic or num_scaleout_ranks == 1 or deterministic_slot_idx != nullptr);
 
     // Utils
     const auto num_ranks = num_scaleout_ranks * num_scaleup_ranks;
@@ -62,7 +114,9 @@ static void launch_dispatch(void* x, void* sf,
     // Notify warps
     // TODO: why don't we use 4 notify warps?
     const int num_notify_warps = cached_mode ? 0 : kNumNotifyWarps;
-    const bool reuse_slot_indices = cached_mode;
+    // The deterministic mode replays the table pre-computed by the deterministic prologue, just
+    // like the cached mode replays the one recorded at forward
+    const bool reuse_slot_indices = cached_mode or deterministic;
     const int num_notify_smem_bytes = cached_mode ? 0 : get_num_notify_smem_bytes(num_ranks, num_experts);
     EP_HOST_ASSERT(num_notify_warps % 4 == 0);
 
@@ -101,9 +155,9 @@ static void launch_dispatch(void* x, void* sf,
             num_qps, num_timeout_cycles);
     } else {
         header_name = "hybrid_dispatch";
-        func_name = std::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+        func_name = std::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
             do_cpu_sync,
-            reuse_slot_indices,
+            cached_mode, deterministic,
             num_sms,
             num_notify_warps, num_scaleout_warps, num_forward_warps,
             num_scaleout_ranks, num_scaleup_ranks,
@@ -154,6 +208,7 @@ static void __instantiate_kernel() {{
             psum_num_recv_tokens_per_expert,
             num_unaligned_recv_tokens_per_expert,
             dst_buffer_slot_idx,
+            deterministic_slot_idx,
             token_metadata_at_forward,
             num_tokens,
             sf_token_stride, sf_hidden_stride,
@@ -183,6 +238,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
                                           const bool& do_zero_padding,
+                                          const bool& row_form,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -194,9 +250,9 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
 #include <deep_ep/impls/ep/dispatch_copy_epilogue.cuh>
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)", do_expand, cached_mode, do_zero_padding,
+)", do_expand, cached_mode, do_zero_padding, row_form,
         num_sms, num_channels, num_warps,
         num_scaleout_ranks, num_scaleup_ranks,
         num_hidden_bytes, num_sf_packs,

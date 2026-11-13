@@ -41,6 +41,25 @@ def check_nccl_so():
          f'please contact Chenggang or Shangyan to upgrade PyTorch NCCL version')
 
 
+def align_paddle_nccl_dir():
+    """
+    Point Paddle's `FLAGS_nccl_dir` at the NCCL this extension was linked against.
+
+    NOTE: Paddle-specific. A pip-installed Paddle wheel unconditionally sets that flag to its own
+    bundled NCCL while `import paddle` runs, which is not necessarily the version DeepEP needs
+    (DeepEP V2.5 requires >= 2.32.3 for the GIN API). Two NCCL runtimes in one process segfault as
+    soon as Paddle creates a communicator -- and that happens after `check_nccl_so()` below, so the
+    check cannot catch it. Realign the flag before anything builds a process group.
+    """
+    import paddle
+
+    nccl_lib_dir = os.path.join(find_nccl_root(), 'lib')
+    if not os.path.isdir(nccl_lib_dir):
+        return
+    if paddle.get_flags(['FLAGS_nccl_dir'])['FLAGS_nccl_dir'] != nccl_lib_dir:
+        paddle.set_flags({'FLAGS_nccl_dir': nccl_lib_dir})
+
+
 def init_jit():
     """
     Initialize the JIT compilation runtime.
@@ -56,6 +75,7 @@ def init_jit():
 
 
 # Run initialization
+align_paddle_nccl_dir()
 check_nccl_so()
 init_jit()
 
